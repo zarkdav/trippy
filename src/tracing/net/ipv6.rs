@@ -24,7 +24,7 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv6Addr, Shutdown, SocketAddr};
 use std::time::SystemTime;
 #[cfg(windows)]
-use windows::Win32::Networking::WinSock::WSA_IO_INCOMPLETE;
+use windows_sys::Win32::Networking::WinSock::WSA_IO_INCOMPLETE;
 
 #[cfg(windows)]
 use platform::Socket;
@@ -210,10 +210,15 @@ pub fn recv_icmp_probe(
     direction: PortDirection,
 ) -> TraceResult<Option<ProbeResponse>> {
     if recv_socket.get_overlapped_result() {
-        let buf = recv_socket.wbuf.buf;
-        let bytes = unsafe { buf.as_bytes() };
+        let buf = recv_socket.wbuf.0.buf;
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                recv_socket.wbuf.0.buf,
+                recv_socket.wbuf.0.len.try_into().unwrap(),
+            )
+        };
         let icmp_v6 = IcmpPacket::new_view(bytes).req()?;
-        let addr = platform::sockaddrptr_to_ipaddr(std::ptr::addr_of!(recv_socket.from))?;
+        let addr = platform::sockaddrptr_to_ipaddr(unsafe { recv_socket.from })?;
         // post the WSARecvFrom again, so that the next OVERLAPPED event can get triggered
         recv_socket.recv_from()?;
         if let IpAddr::V6(src_addr) = addr {
@@ -222,7 +227,7 @@ pub fn recv_icmp_probe(
             Err(TracerError::InvalidSourceAddr(addr))
         }
     } else if let Some(os_err) = Error::last_os_error().raw_os_error() {
-        if os_err == WSA_IO_INCOMPLETE.0 {
+        if os_err == WSA_IO_INCOMPLETE {
             Ok(None)
         } else {
             Err(TracerError::IoError(Error::last_os_error()))

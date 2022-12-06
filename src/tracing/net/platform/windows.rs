@@ -8,53 +8,49 @@ use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::mem::MaybeUninit;
 use std::mem::{align_of, size_of};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
-use windows::core::PSTR;
-use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR, WAIT_TIMEOUT};
-use windows::Win32::NetworkManagement::IpHelper;
-use windows::Win32::Networking::WinSock::{
+use widestring::WideCString;
+use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR, WAIT_TIMEOUT};
+use windows_sys::Win32::NetworkManagement::IpHelper;
+use windows_sys::Win32::Networking::WinSock::{
     bind, closesocket, sendto, setsockopt, socket, WSACleanup, WSACloseEvent, WSACreateEvent,
     WSAGetOverlappedResult, WSAIoctl, WSARecvFrom, WSAStartup, WSAWaitForMultipleEvents,
-    ADDRESS_FAMILY, AF_INET, AF_INET6, FIONBIO, INVALID_SOCKET, IPPROTO, IPPROTO_ICMP,
-    IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_RAW, IPPROTO_TCP, IPPROTO_UDP,
-    IPV6_UNICAST_HOPS, IP_HDRINCL, SIO_ROUTING_INTERFACE_QUERY, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKET, SOCKET_ERROR, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_SOCKET,
-    SO_PORT_SCALABILITY, WSABUF, WSADATA, WSA_WAIT_FAILED,
+    ADDRESS_FAMILY, AF_INET, AF_INET6, FIONBIO, IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET, IN_ADDR,
+    IN_ADDR_0, IPPROTO, IPPROTO_ICMP, IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_RAW,
+    IPPROTO_TCP, IPPROTO_UDP, IPV6_UNICAST_HOPS, IP_HDRINCL, SIO_ROUTING_INTERFACE_QUERY, SOCKADDR,
+    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET, SOCKET_ERROR, SOCK_DGRAM, SOCK_RAW,
+    SOCK_STREAM, SOL_SOCKET, SO_PORT_SCALABILITY, WSABUF, WSADATA, WSA_WAIT_FAILED,
 };
-use windows::Win32::System::IO::OVERLAPPED;
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
-// type Socket = SOCKET;
 #[derive(Debug)]
 pub struct Socket {
     pub s: SOCKET,
     pub ol: Overlapped,
-    pub wbuf: WSABUF,
-    pub from: SOCKADDR,
+    pub wbuf: WsaBuf,
+    pub from: *mut SOCKADDR,
 }
 impl Socket {
     #[allow(unsafe_code)]
     pub fn create(af: ADDRESS_FAMILY, r#type: u16, protocol: IPPROTO) -> TraceResult<Self> {
         let s = make_socket(af, r#type, protocol)?;
 
-        let from = SOCKADDR::default();
-
-        let layout =
-            Layout::from_size_align(MAX_PACKET_SIZE, std::mem::align_of::<WSABUF>()).unwrap();
-        let ptr = unsafe { alloc(layout) };
+        let from = MaybeUninit::<SOCKADDR>::zeroed().as_mut_ptr();
+        let ptr = [0u8; MAX_PACKET_SIZE].as_mut_ptr();
 
         let wbuf = WSABUF {
+            buf: ptr,
             len: MAX_PACKET_SIZE as u32,
-            buf: PSTR::from_raw(ptr),
         };
 
         // let ol = create_overlapped_event()?;
-        let ol = OVERLAPPED::default();
+        let ol = unsafe { core::mem::zeroed() };
 
         Ok(Self {
             s,
             ol: Overlapped(ol),
-            wbuf,
+            wbuf: WsaBuf(wbuf),
             from,
         })
     }
@@ -91,7 +87,8 @@ impl Socket {
         let rc = unsafe {
             sendto(
                 self.s,
-                packet,
+                std::ptr::addr_of!(packet).cast(),
+                packet.len().try_into().unwrap(),
                 0,
                 std::ptr::addr_of!(addr).cast(),
                 addrlen.try_into().unwrap(),
@@ -107,7 +104,7 @@ impl Socket {
     #[allow(unsafe_code)]
     pub fn get_overlapped_result(&self) -> bool {
         // let ol = self.ol.0;
-        unsafe { WSAGetOverlappedResult(self.s, &self.ol.0, &mut 0, false, &mut 0) }.as_bool()
+        (unsafe { WSAGetOverlappedResult(self.s, &self.ol.0, &mut 0, 0, &mut 0) } != 0)
     }
 
     #[allow(unsafe_code)]
@@ -128,12 +125,12 @@ impl Socket {
             WSAIoctl(
                 self.s,
                 FIONBIO as u32,
-                Some(std::ptr::addr_of!(non_blocking).cast()),
+                std::ptr::addr_of!(non_blocking).cast(),
                 size_of::<u32>().try_into().unwrap(),
-                None,
+                std::ptr::null_mut(),
                 0,
                 &mut 0,
-                None,
+                std::ptr::null_mut(),
                 None,
             )
         } == SOCKET_ERROR
@@ -149,13 +146,14 @@ impl Socket {
     fn set_header_included(self, is_header_included: bool) -> TraceResult<Self> {
         let u32_header_included: u32 = if is_header_included { 1 } else { 0 };
         let header_included = u32_header_included.to_ne_bytes();
-        let optval = Some(&header_included[..]);
+        let optval = std::ptr::addr_of!(header_included).cast();
         if unsafe {
             setsockopt(
                 self.s,
                 IPPROTO_IP.try_into().unwrap(),
                 IP_HDRINCL.try_into().unwrap(),
                 optval,
+                std::mem::size_of::<u32>().try_into().unwrap(),
             )
         } == SOCKET_ERROR
         {
@@ -168,14 +166,16 @@ impl Socket {
 
     #[allow(unsafe_code)]
     fn set_reuse_port(self, is_reuse_port: bool) -> TraceResult<Self> {
-        let reuse_port = [is_reuse_port.try_into().unwrap()];
-        let optval = Some(&reuse_port[..]);
+        let u32_reuse_port: u32 = if is_reuse_port { 1 } else { 0 };
+        let reuse_port = u32_reuse_port.to_ne_bytes();
+        let optval = std::ptr::addr_of!(reuse_port).cast();
         if unsafe {
             setsockopt(
                 self.s,
                 SOL_SOCKET.try_into().unwrap(),
                 SO_PORT_SCALABILITY.try_into().unwrap(),
                 optval,
+                std::mem::size_of::<u32>().try_into().unwrap(),
             )
         } == SOCKET_ERROR
         {
@@ -191,9 +191,10 @@ impl Socket {
         if unsafe {
             setsockopt(
                 self.s,
-                IPPROTO_IPV6.0,
+                IPPROTO_IPV6,
                 IPV6_UNICAST_HOPS.try_into().unwrap(),
-                Some(&[max_hops]),
+                &max_hops, // TODO check LE/BE
+                std::mem::size_of::<u32>().try_into().unwrap(),
             )
         } == SOCKET_ERROR
         {
@@ -209,12 +210,13 @@ impl Socket {
         let ret = unsafe {
             WSARecvFrom(
                 self.s,
-                &[self.wbuf],
-                Some(&mut 0),
+                &self.wbuf.0,
+                1,
                 &mut 0,
-                Some(&mut self.from),
-                Some(&mut fromlen),
-                Some(&mut self.ol.0),
+                &mut 0,
+                self.from,
+                &mut fromlen,
+                &mut self.ol.0,
                 None,
             )
         };
@@ -266,6 +268,16 @@ impl convert::From<&mut Overlapped> for OVERLAPPED {
     }
 }
 
+pub struct WsaBuf(pub WSABUF);
+impl fmt::Debug for WsaBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WsaBuf")
+            .field("buf", &self.0.buf)
+            .field("len", &self.0.len)
+            .finish()
+    }
+}
+
 #[allow(unsafe_code)]
 pub fn startup() -> TraceResult<()> {
     const WINSOCK_VERSION: u16 = 0x202; // 2.2
@@ -286,13 +298,13 @@ pub fn startup() -> TraceResult<()> {
 pub fn cleanup(sockets: &[Socket]) -> TraceResult<()> {
     let layout = Layout::from_size_align(MAX_PACKET_SIZE, std::mem::align_of::<WSABUF>()).unwrap();
     for sock in sockets {
-        if unsafe { closesocket(sock) } == SOCKET_ERROR {
+        if unsafe { closesocket(sock.s) } == SOCKET_ERROR {
             return Err(TracerError::IoError(Error::last_os_error()));
         }
-        if !sock.ol.0.hEvent.is_invalid() && unsafe { WSACloseEvent(sock.ol.0.hEvent) } == false {
+        if sock.ol.0.hEvent != 0 && unsafe { WSACloseEvent(sock.ol.0.hEvent) } == 0 {
             return Err(TracerError::IoError(Error::last_os_error()));
         }
-        unsafe { dealloc(sock.wbuf.buf.as_ptr(), layout) };
+        unsafe { dealloc(sock.wbuf.0.buf, layout) };
         // should we cleanup sock.from too?
     }
     if unsafe { WSACleanup() } == SOCKET_ERROR {
@@ -348,21 +360,21 @@ fn lookup_interface_addr(family: ADDRESS_FAMILY, name: &str) -> TraceResult<IpAd
             IpHelper::GetAdaptersAddresses(
                 family,
                 flags,
-                None,
-                Some(ip_adapter_address),
+                std::ptr::null_mut(),
+                ip_adapter_address,
                 &mut buf_len,
             )
         };
         i += 1;
 
-        if res != ERROR_BUFFER_OVERFLOW.0 || i > MAX_TRIES {
+        if res != ERROR_BUFFER_OVERFLOW || i > MAX_TRIES {
             break;
         }
 
         unsafe { dealloc(list_ptr, layout) };
     }
 
-    if res != NO_ERROR.0 {
+    if res != NO_ERROR {
         return Err(TracerError::ErrorString(format!(
             "GetAdaptersAddresses returned error: {}",
             Error::from_raw_os_error(res.try_into().unwrap())
@@ -370,7 +382,12 @@ fn lookup_interface_addr(family: ADDRESS_FAMILY, name: &str) -> TraceResult<IpAd
     }
 
     while !ip_adapter_address.is_null() {
-        let friendly_name = unsafe { (*ip_adapter_address).FriendlyName.to_string().unwrap() };
+        let friendly_name = unsafe {
+            let friendly_name = (*ip_adapter_address).FriendlyName;
+            WideCString::from_ptr_str(friendly_name)
+                .to_string()
+                .unwrap()
+        };
         if name == friendly_name {
             // PANIC should not occur as GetAdaptersAddress should return valid PWSTR
             // NOTE this really should be a while over the linked list of FistUnicastAddress, and current_unicast would then be mutable
@@ -402,13 +419,15 @@ fn lookup_interface_addr(family: ADDRESS_FAMILY, name: &str) -> TraceResult<IpAd
 #[allow(unsafe_code)]
 pub fn sockaddrptr_to_ipaddr(ptr: *const SOCKADDR) -> TraceResult<IpAddr> {
     let af = unsafe { u32::from((*ptr).sa_family) };
-    if af == AF_INET.0 {
+    if af == AF_INET {
         let ipv4addr = unsafe { (*(ptr.cast::<SOCKADDR_IN>())).sin_addr };
-        Ok(IpAddr::V4(Ipv4Addr::from(ipv4addr)))
-    } else if af == AF_INET6.0 {
+        Ok(IpAddr::V4(Ipv4Addr::from(unsafe {
+            ipv4addr.S_un.S_addr.to_ne_bytes()
+        })))
+    } else if af == AF_INET6 {
         #[allow(clippy::cast_ptr_alignment)]
         let ipv6addr = unsafe { (*(ptr.cast::<SOCKADDR_IN6>())).sin6_addr };
-        Ok(IpAddr::V6(Ipv6Addr::from(ipv6addr)))
+        Ok(IpAddr::V6(Ipv6Addr::from(unsafe { ipv6addr.u.Byte })))
     } else {
         Err(TracerError::IoError(Error::new(
             ErrorKind::Unsupported,
@@ -421,16 +440,35 @@ pub fn sockaddrptr_to_ipaddr(ptr: *const SOCKADDR) -> TraceResult<IpAddr> {
 pub fn ipaddr_to_sockaddr(source_addr: IpAddr) -> (SOCKADDR, u32) {
     let (paddr, addrlen): (*const SOCKADDR, u32) = match source_addr {
         IpAddr::V4(ipv4addr) => {
-            let sa: SOCKADDR_IN = SocketAddrV4::new(ipv4addr, 0).into();
+            let sai = SOCKADDR_IN {
+                sin_family: AF_INET.try_into().unwrap(),
+                sin_port: 0,
+                sin_addr: IN_ADDR {
+                    S_un: IN_ADDR_0 {
+                        S_addr: u32::from(ipv4addr).to_be(),
+                    },
+                },
+                sin_zero: [0; 8],
+            };
             (
-                std::ptr::addr_of!(sa).cast(),
+                std::ptr::addr_of!(sai).cast(),
                 size_of::<SOCKADDR_IN>().try_into().unwrap(),
             )
         }
         IpAddr::V6(ipv6addr) => {
-            let sa: SOCKADDR_IN6 = SocketAddrV6::new(ipv6addr, 0, 0, 0).into();
+            let sai = SOCKADDR_IN6 {
+                sin6_family: AF_INET6.try_into().unwrap(),
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: IN6_ADDR {
+                    u: IN6_ADDR_0 {
+                        Byte: ipv6addr.octets(),
+                    },
+                },
+                Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: 0 },
+            };
             (
-                std::ptr::addr_of!(sa).cast(),
+                std::ptr::addr_of!(sai).cast(),
                 size_of::<SOCKADDR_IN6>().try_into().unwrap(),
             )
         }
@@ -454,14 +492,14 @@ pub fn routing_interface_query(target: IpAddr) -> TraceResult<IpAddr> {
     let (dest, destlen) = ipaddr_to_sockaddr(target);
     let rc = unsafe {
         WSAIoctl(
-            s,
+            s.s,
             SIO_ROUTING_INTERFACE_QUERY,
-            Some(std::ptr::addr_of!(dest).cast()),
+            std::ptr::addr_of!(dest).cast(),
             destlen,
-            Some(src),
+            src,
             1024,
             bytes,
-            None,
+            std::ptr::null_mut(),
             None,
         )
     };
@@ -481,7 +519,7 @@ pub fn routing_interface_query(target: IpAddr) -> TraceResult<IpAddr> {
 
 #[allow(unsafe_code)]
 fn make_socket(af: ADDRESS_FAMILY, r#type: u16, protocol: IPPROTO) -> TraceResult<SOCKET> {
-    let s = unsafe { socket(af.0.try_into().unwrap(), i32::from(r#type), protocol.0) };
+    let s = unsafe { socket(af.try_into().unwrap(), i32::from(r#type), protocol) };
     if s == INVALID_SOCKET {
         eprintln!("make_socket: socket failed");
         Err(TracerError::IoError(Error::last_os_error()))
@@ -493,11 +531,9 @@ fn make_socket(af: ADDRESS_FAMILY, r#type: u16, protocol: IPPROTO) -> TraceResul
 
 #[allow(unsafe_code)]
 fn create_overlapped_event() -> TraceResult<OVERLAPPED> {
-    let recv_ol = OVERLAPPED {
-        hEvent: unsafe { WSACreateEvent() },
-        ..Default::default()
-    };
-    if recv_ol.hEvent.is_invalid() {
+    let mut recv_ol: OVERLAPPED = unsafe { core::mem::zeroed() };
+    recv_ol.hEvent = unsafe { WSACreateEvent() };
+    if recv_ol.hEvent == 0 {
         eprintln!("create_overlapped_event: WSACreateEvent failed");
         return Err(TracerError::IoError(Error::last_os_error()));
     }
@@ -568,7 +604,7 @@ pub fn make_stream_socket_ipv6() -> TraceResult<Socket> {
 pub fn is_readable(sock: &Socket, timeout: Duration) -> TraceResult<bool> {
     let millis = timeout.as_millis().try_into().unwrap();
     let ev = sock.ol.0.hEvent;
-    let rc = unsafe { WSAWaitForMultipleEvents(&[ev], true, millis, false) };
+    let rc = unsafe { WSAWaitForMultipleEvents(1, &[ev] as *const _, 1, millis, 0) };
     eprintln!(
         "WSAWaitForMultipleEvents on Overlapped {:?} returned {}",
         ev, rc
@@ -577,7 +613,7 @@ pub fn is_readable(sock: &Socket, timeout: Duration) -> TraceResult<bool> {
         eprintln!("is_readable: WSAWaitForMultipleEvents failed");
         return Err(TracerError::IoError(Error::last_os_error()));
     }
-    Ok(rc != WAIT_TIMEOUT.0)
+    Ok(rc != WAIT_TIMEOUT)
 }
 
 /// TODO

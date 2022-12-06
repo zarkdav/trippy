@@ -28,7 +28,7 @@ use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
 use std::time::SystemTime;
 
 #[cfg(windows)]
-use windows::Win32::Networking::WinSock::WSA_IO_INCOMPLETE;
+use windows_sys::Win32::Networking::WinSock::WSA_IO_INCOMPLETE;
 
 #[cfg(windows)]
 use platform::Socket;
@@ -268,8 +268,13 @@ pub fn recv_icmp_probe(
     direction: PortDirection,
 ) -> TraceResult<Option<ProbeResponse>> {
     if recv_socket.get_overlapped_result() {
-        let buf = recv_socket.wbuf.buf;
-        let bytes = unsafe { buf.as_bytes() };
+        let buf = recv_socket.wbuf.0.buf;
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                recv_socket.wbuf.0.buf,
+                recv_socket.wbuf.0.len.try_into().unwrap(),
+            )
+        };
         let ipv4 = Ipv4Packet::new_view(bytes).req()?;
         // post the WSARecvFrom again, so that the next OVERLAPPED event can get triggered
         recv_socket.recv_from()?;
@@ -280,7 +285,7 @@ pub fn recv_icmp_probe(
             &ipv4,
         )?)
     } else if let Some(os_err) = Error::last_os_error().raw_os_error() {
-        if os_err == WSA_IO_INCOMPLETE.0 {
+        if os_err == WSA_IO_INCOMPLETE {
             Ok(None)
         } else {
             eprintln!("recv_icmp_probe: WSAGetOverlappedResult failed with error");
